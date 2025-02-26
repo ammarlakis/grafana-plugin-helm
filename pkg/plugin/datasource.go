@@ -4,113 +4,152 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend"
-	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 	"github.com/grafana/grafana-plugin-sdk-go/data"
-	"github.com/ammarlakis/grafana-plugin-helm/pkg/models"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"github.com/grafana/grafana-plugin-sdk-go/backend/instancemgmt"
 )
 
+// HelmQuery represents the expected structure of JSON input.
+type HelmQuery struct {
+	Namespace   string `json:"namespace"`
+	ReleaseName string `json:"release"`
+}
 // Make sure Datasource implements required interfaces. This is important to do
 // since otherwise we will only get a not implemented error response from plugin in
-// runtime. In this example datasource instance implements backend.QueryDataHandler,
-// backend.CheckHealthHandler interfaces. Plugin should not implement all these
-// interfaces - only those which are required for a particular task.
+// runtime. In this example datasource instance implements backend.QueryDataHandler.
 var (
 	_ backend.QueryDataHandler      = (*Datasource)(nil)
-	_ backend.CheckHealthHandler    = (*Datasource)(nil)
-	_ instancemgmt.InstanceDisposer = (*Datasource)(nil)
-)
-
-// NewDatasource creates a new datasource instance.
-func NewDatasource(_ context.Context, _ backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
-	return &Datasource{}, nil
-}
-
-// Datasource is an example datasource which can respond to data queries, reports
-// its health and has streaming skills.
 type Datasource struct{}
 
-// Dispose here tells plugin SDK that plugin wants to clean up resources when a new instance
-// created. As soon as datasource settings change detected by SDK old datasource instance will
-// be disposed and a new one will be created using NewSampleDatasource factory function.
-func (d *Datasource) Dispose() {
-	// Clean up datasource instance resources.
+// Resource represents a Kubernetes resource.
+type Resource struct {
+	Kind   string `json:"kind"`
+	Name   string `json:"name"`
+	Status string `json:"status,omitempty"`
 }
 
-// QueryData handles multiple queries and returns multiple responses.
-// req contains the queries []DataQuery (where each query contains RefID as a unique identifier).
-// The QueryDataResponse contains a map of RefID to the response for each query, and each response
-// contains Frames ([]*Frame).
-func (d *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
-	// create response struct
+// getKubernetesClient initializes a Kubernetes client.
+func getKubernetesClient() (*kubernetes.Clientset, error) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create in-cluster config: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create clientset: %w", err)
+	}
+	return clientset, nil
+}
+
+// getHelmResources fetches all resources associated with a Helm release.
+func getHelmResources(namespace, releaseName string) ([]Resource, error) {
+	clientset, err := getKubernetesClient()
+	if err != nil {
+		return nil, err
+	}
+
+	labelSelector := fmt.Sprintf("app.kubernetes.io/instance=%s", releaseName)
+	var resources []Resource
+
+	// Fetch Pods
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods: %w", err)
+	}
+	for _, pod := range pods.Items {
+		resources = append(resources, Resource{"Pod", pod.Name, string(pod.Status.Phase)})
+	}
+
+	// Fetch Services
+	services, err := clientset.CoreV1().Services(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list services: %w", err)
+	}
+	for _, service := range services.Items {
+		resources = append(resources, Resource{"Service", service.Name, ""})
+	}
+
+	// Fetch Deployments
+	deployments, err := clientset.AppsV1().Deployments(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: labelSelector})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list deployments: %w", err)
+	}
+	for _, deployment := range deployments.Items {
+		resources = append(resources, Resource{"Deployment", deployment.Name, ""})
+	}
+
+	return resources, nil
+}
+
+// QueryData handles requests from Grafana.
+func (ds *Datasource) QueryData(ctx context.Context, req *backend.QueryDataRequest) (*backend.QueryDataResponse, error) {
 	response := backend.NewQueryDataResponse()
 
-	// loop over queries and execute them individually.
-	for _, q := range req.Queries {
-		res := d.query(ctx, req.PluginContext, q)
+	for _, query := range req.Queries {
+		queryData := backend.DataResponse{}
 
-		// save the response in a hashmap
-		// based on with RefID as identifier
-		response.Responses[q.RefID] = res
+		// Step 1: Unmarshal JSON query data
+		var helmQuery HelmQuery
+		err := json.Unmarshal(query.JSON, &helmQuery)
+		if err != nil {
+			queryData.Error = fmt.Errorf("failed to parse query JSON: %v", err)
+			response.Responses[query.RefID] = queryData
+			continue
+		}
+
+		// Step 2: Validate extracted fields
+		if helmQuery.Namespace == "" {
+			queryData.Error = fmt.Errorf("missing or invalid 'namespace'")
+			response.Responses[query.RefID] = queryData
+			continue
+		}
+		if helmQuery.ReleaseName == "" {
+			queryData.Error = fmt.Errorf("missing or invalid 'release'")
+			response.Responses[query.RefID] = queryData
+			continue
+		}
+
+		// Step 3: Fetch resources from Kubernetes
+		resources, err := getHelmResources(helmQuery.Namespace, helmQuery.ReleaseName)
+		if err != nil {
+			queryData.Error = err
+		} else {
+			queryData.Error = nil
+			// Step 4: Use data.NewFrame for structured response
+			frame := data.NewFrame("response",
+				data.NewField("kind", nil, []string{}),
+				data.NewField("name", nil, []string{}),
+				data.NewField("status", nil, []string{}),
+			)
+
+			for _, resource := range resources {
+				frame.AppendRow(resource.Kind, resource.Name, resource.Status)
+			}
+
+			queryData.Frames = append(queryData.Frames, frame)
+		}
+
+		response.Responses[query.RefID] = queryData
 	}
 
 	return response, nil
 }
 
-type queryModel struct{}
 
-func (d *Datasource) query(_ context.Context, pCtx backend.PluginContext, query backend.DataQuery) backend.DataResponse {
-	var response backend.DataResponse
 
-	// Unmarshal the JSON into our queryModel.
-	var qm queryModel
 
-	err := json.Unmarshal(query.JSON, &qm)
-	if err != nil {
-		return backend.ErrDataResponse(backend.StatusBadRequest, fmt.Sprintf("json unmarshal: %v", err.Error()))
-	}
 
-	// create data frame response.
-	// For an overview on data frames and how grafana handles them:
-	// https://grafana.com/developers/plugin-tools/introduction/data-frames
-	frame := data.NewFrame("response")
 
-	// add fields.
-	frame.Fields = append(frame.Fields,
-		data.NewField("time", nil, []time.Time{query.TimeRange.From, query.TimeRange.To}),
-		data.NewField("values", nil, []int64{10, 20}),
-	)
 
-	// add the frames to the response.
-	response.Frames = append(response.Frames, frame)
 
-	return response
-}
 
-// CheckHealth handles health checks sent from Grafana to the plugin.
-// The main use case for these health checks is the test button on the
-// datasource configuration page which allows users to verify that
-// a datasource is working as expected.
-func (d *Datasource) CheckHealth(_ context.Context, req *backend.CheckHealthRequest) (*backend.CheckHealthResult, error) {
-	res := &backend.CheckHealthResult{}
-	config, err := models.LoadPluginSettings(*req.PluginContext.DataSourceInstanceSettings)
 
-	if err != nil {
-		res.Status = backend.HealthStatusError
-		res.Message = "Unable to load settings"
-		return res, nil
-	}
 
-	if config.Secrets.ApiKey == "" {
-		res.Status = backend.HealthStatusError
-		res.Message = "API key is missing"
-		return res, nil
-	}
-
-	return &backend.CheckHealthResult{
-		Status:  backend.HealthStatusOk,
-		Message: "Data source is working",
-	}, nil
+// NewDatasource creates a new instance of the datasource.
+func NewDatasource(_ backend.DataSourceInstanceSettings) (instancemgmt.Instance, error) {
+	return &Datasource{}, nil 
 }
